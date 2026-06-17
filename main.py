@@ -1,7 +1,8 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
-import uuid, os, re
+import uuid, os, re, zipfile, io
 
 from google.adk.agents import LlmAgent
 from google.adk.runners import Runner
@@ -178,6 +179,41 @@ async def get_skill_file(draft_id: str, file_path: str):
         content = f.read()
 
     return {"file_path": file_path, "content": content}
+
+
+@app.get("/skills/{draft_id}/download")
+async def download_skill_zip(draft_id: str):
+    """Download the entire skill as a zip file.
+
+    Example:
+      GET /skills/{draft_id}/download
+      → pr-security-review.zip containing SKILL.md, references/, scripts/, assets/
+    """
+    if draft_id not in draft_registry:
+        raise HTTPException(status_code=404, detail="Draft not found")
+
+    entry = draft_registry[draft_id]
+    skill_dir = entry["skill_path"]
+    skill_name = entry["skill_name"]
+
+    if not os.path.isdir(skill_dir):
+        raise HTTPException(status_code=404, detail="Skill files not found on disk")
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for root, _, files in os.walk(skill_dir):
+            for fname in files:
+                abs_path = os.path.join(root, fname)
+                # Zip entry path: skill-name/SKILL.md, skill-name/references/REFERENCE.md, etc.
+                arc_path = os.path.join(skill_name, os.path.relpath(abs_path, skill_dir))
+                zf.write(abs_path, arc_path)
+
+    buffer.seek(0)
+    return StreamingResponse(
+        buffer,
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename={skill_name}.zip"},
+    )
 
 
 @app.get("/skills")
