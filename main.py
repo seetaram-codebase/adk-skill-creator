@@ -306,6 +306,151 @@ async def download_skill_zip(draft_id: str):
     )
 
 
+# Chat session registry: session_id -> adk_session_id
+chat_sessions: dict[str, str] = {}
+
+
+class ChatRequest(BaseModel):
+    message: str
+    session_id: Optional[str] = None  # omit to start a new conversation
+
+
+class ChatResponse(BaseModel):
+    session_id: str
+    reply: str
+    draft_id: Optional[str] = None   # set when agent produces a skill draft
+
+
+@app.post("/skills/chat", response_model=ChatResponse)
+async def skill_chat(req: ChatRequest):
+    """Multi-turn conversation for iterative skill creation.
+
+    Start a new conversation by omitting session_id.
+    Pass the returned session_id in subsequent turns to continue.
+    A draft_id is returned whenever the agent produces a SKILL.md.
+    """
+    sid = req.session_id or str(uuid.uuid4())
+
+    # Get or create ADK session for this conversation
+    if sid not in chat_sessions:
+        adk_session = await session_service.create_session(
+            app_name="skill-builder-api",
+            user_id=sid,
+        )
+        chat_sessions[sid] = adk_session.id
+
+    message = types.Content(
+        role="user",
+        parts=[types.Part(text=req.message)]
+    )
+
+    reply = ""
+    async for event in runner.run_async(
+        user_id=sid,
+        session_id=chat_sessions[sid],
+        new_message=message,
+    ):
+        if event.is_final_response() and event.content:
+            for part in event.content.parts:
+                if part.text:
+                    reply += part.text
+
+    # Save draft if agent produced a skill
+    draft_id = None
+    blocks = re.findall(r"```(\S+)\n(.*?)```", reply, re.DOTALL)
+    if blocks and any(f == "skill.md" for f, _ in blocks):
+        try:
+            skill_name, skill_dir, files_created = _parse_and_save(reply, None)
+            draft_id = str(uuid.uuid4())
+            draft_registry[draft_id] = {
+                "skill_name": skill_name,
+                "skill_path": skill_dir,
+                "files": {f: open(os.path.join(skill_dir, f)).read() for f in files_created},
+            }
+        except ValueError:
+            pass  # agent replied with text only, no skill yet
+
+    return ChatResponse(session_id=sid, reply=reply, draft_id=draft_id)
+
+
+@app.post("/skills/chat/stream")
+async def skill_chat_stream(req: ChatRequest):
+    """Multi-turn conversation with SSE streaming.
+
+    Events:
+      status  — phase progress: {message}
+      token   — partial reply: {text}
+      draft   — skill draft saved: {draft_id, skill_name, files_created}
+      done    — turn complete: {session_id, draft_id}
+      error   — failure: {detail}
+    """
+    async def event_stream() -> AsyncGenerator[str, None]:
+        try:
+            sid = req.session_id or str(uuid.uuid4())
+
+            if sid not in chat_sessions:
+                yield sse("status", {"message": "Starting new conversation..."})
+                adk_session = await session_service.create_session(
+                    app_name="skill-builder-api",
+                    user_id=sid,
+                )
+                chat_sessions[sid] = adk_session.id
+            else:
+                yield sse("status", {"message": "Continuing conversation..."})
+
+            message = types.Content(
+                role="user",
+                parts=[types.Part(text=req.message)]
+            )
+
+            reply = ""
+            async for event in runner.run_async(
+                user_id=sid,
+                session_id=chat_sessions[sid],
+                new_message=message,
+            ):
+                if hasattr(event, "content") and event.content:
+                    for part in event.content.parts:
+                        if part.text and not event.is_final_response():
+                            yield sse("token", {"text": part.text})
+
+                if event.is_final_response() and event.content:
+                    for part in event.content.parts:
+                        if part.text:
+                            reply += part.text
+
+            # Save draft if this turn produced a skill
+            draft_id = None
+            blocks = re.findall(r"```(\S+)\n(.*?)```", reply, re.DOTALL)
+            if blocks and any(f == "skill.md" for f, _ in blocks):
+                try:
+                    skill_name, skill_dir, files_created = _parse_and_save(reply, None)
+                    draft_id = str(uuid.uuid4())
+                    draft_registry[draft_id] = {
+                        "skill_name": skill_name,
+                        "skill_path": skill_dir,
+                        "files": {f: open(os.path.join(skill_dir, f)).read() for f in files_created},
+                    }
+                    yield sse("draft", {
+                        "draft_id": draft_id,
+                        "skill_name": skill_name,
+                        "files_created": files_created,
+                    })
+                except ValueError:
+                    pass
+
+            yield sse("done", {"session_id": sid, "draft_id": draft_id})
+
+        except Exception as e:
+            yield sse("error", {"detail": str(e)})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.get("/skills")
 async def list_skills():
     """List all generated skill drafts."""
