@@ -9,17 +9,94 @@ A production-ready FastAPI service that creates [agentskills.io](https://agentsk
 3. Each skill is saved as a draft — fetch or download anytime via `draft_id`
 4. Refine the skill across multiple turns using the same `session_id`
 
+### Architecture
+
+```mermaid
+flowchart TD
+    Client([Client])
+
+    subgraph API["FastAPI — main.py"]
+        CS[POST /skills/chat/stream]
+        CN[POST /skills/chat]
+        GD[GET /skills/draft_id]
+        GF[GET /skills/draft_id/files/path]
+        DL[GET /skills/draft_id/download]
+        LS[GET /skills]
+        HE[GET /health]
+    end
+
+    subgraph Core["Core Modules"]
+        AG["agent.py\nADK LlmAgent + Runner\nSkillToolset"]
+        SK["skills.py\nParse · Save · Zip"]
+        ST["storage.py\nSQLite"]
+    end
+
+    subgraph Persist["Persistence"]
+        DB[(skill_builder.db\ndrafts · sessions)]
+        FS[/generated-skills/\nskill-name/SKILL.md\nreferences · scripts · assets/]
+    end
+
+    subgraph External["External"]
+        ADK[Google ADK]
+        GEM[Gemini 2.5 Pro]
+        SKILL[skill-creator\nSKILL.md]
+    end
+
+    Client -->|message + session_id| CS
+    Client -->|message + session_id| CN
+    Client -->|draft_id| GD
+    Client -->|draft_id + path| GF
+    Client -->|draft_id| DL
+    Client --> LS
+    Client --> HE
+
+    CS -->|run_async| AG
+    CN -->|run_async| AG
+    AG -->|SkillToolset| SKILL
+    AG -->|API calls| ADK
+    ADK -->|inference| GEM
+    AG -->|raw output| SK
+    SK -->|write files| FS
+    SK -->|save_draft| ST
+    ST -->|read/write| DB
+
+    GD -->|get_draft| ST
+    GF -->|get_draft| ST
+    DL -->|get_draft + build_zip| ST
+    LS -->|list_drafts| ST
 ```
-Turn 1: "create a skill for reviewing PRs"
-Agent:  "What language? What checks matter most?"
 
-Turn 2: "Python, security focus, OWASP Top 10"
-Agent:  → generates SKILL.md + references/REFERENCE.md
-        → draft_id: "f3a1..."
+### Conversation flow
 
-Turn 3: "add SQL injection checks"
-Agent:  → updated skill
-        → draft_id: "g4b2..."
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as FastAPI
+    participant AG as ADK Agent
+    participant SK as skills.py
+    participant DB as SQLite
+
+    C->>API: POST /skills/chat/stream\n{message: "create a skill for PRs"}
+    API-->>C: event: status {session_id}
+    API->>AG: run_async(message)
+    AG-->>API: token stream
+    API-->>C: event: token {text} (repeated)
+    AG-->>API: final response — clarifying question
+    API-->>C: event: done {session_id, draft_id: null}
+
+    C->>API: POST /skills/chat/stream\n{message: "Python, security", session_id}
+    API->>AG: run_async(message, same session)
+    AG-->>API: token stream — writing SKILL.md
+    API-->>C: event: token {text} (repeated)
+    AG-->>API: final response — skill files
+    API->>SK: save_skill_from_output()
+    SK->>DB: save_draft(draft_id)
+    API-->>C: event: draft {draft_id, files_created}
+    API-->>C: event: done {session_id, draft_id}
+
+    C->>API: GET /skills/{draft_id}/download
+    API->>DB: get_draft(draft_id)
+    API-->>C: skill-name.zip
 ```
 
 ## Project structure
