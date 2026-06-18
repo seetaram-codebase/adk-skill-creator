@@ -1,402 +1,100 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional, AsyncGenerator
-import uuid, os, re, zipfile, io, json
+from contextlib import asynccontextmanager
+import uuid, os, json
 
-from google.adk.agents import LlmAgent
-from google.adk.runners import Runner
-from google.adk.sessions import InMemorySessionService
-from google.adk.tools.skill_toolset import SkillToolset
 from google.genai import types
 
-app = FastAPI(title="Skill Builder API", version="1.0.0")
+import storage, agent as ag
+from skills import save_skill_from_output, build_zip, SkillParseError
 
-skill_toolset = SkillToolset(skills_dir="./skills/skill-creator")
 
-agent = LlmAgent(
-    name="skill_builder_agent",
-    model="gemini-2.5-pro",
-    instruction="""You create complete, production-ready skills from user intent.
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    storage.init_db()
+    yield
 
-Use the skill-creator skill to generate all necessary files.
+app = FastAPI(title="Skill Builder API", version="1.0.0", lifespan=lifespan)
 
-Output only the files that are genuinely needed, using named fences:
-
-```skill.md              → SKILL.md with valid frontmatter (name + description required)
-```references/REFERENCE.md  → detailed reference docs (if the skill needs lookup material)
-```scripts/run.py           → helper script (if the skill needs executable code)
-```assets/template.md       → templates or static resources (if the skill needs them)
-
-Rules:
-- skill name must be lowercase, hyphens only, no spaces
-- folder name must match the name field in frontmatter
-- only include files that genuinely add value""",
-    tools=[skill_toolset],
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-session_service = InMemorySessionService()
-runner = Runner(
-    agent=agent,
-    app_name="skill-builder-api",
-    session_service=session_service,
-)
 
-SKILLS_OUTPUT_DIR = "./generated-skills"
-os.makedirs(SKILLS_OUTPUT_DIR, exist_ok=True)
-
-
-class CreateSkillRequest(BaseModel):
-    intent: str
-    name: Optional[str] = None
-
-
-class CreateSkillResponse(BaseModel):
-    draft_id: str
-    skill_name: str
-    skill_path: str
-    files_created: list[str]
-
-
-class GetSkillResponse(BaseModel):
-    draft_id: str
-    skill_name: str
-    skill_path: str
-    files: dict[str, str]
-
-
-# In-memory draft registry: draft_id -> {skill_name, skill_path, files}
-draft_registry: dict[str, dict] = {}
-
-
-def _parse_and_save(raw_output: str, skill_name_override: Optional[str]) -> tuple[str, str, list[str]]:
-    """Parse fenced blocks from agent output, save to disk, return (skill_name, skill_dir, files_created)."""
-    blocks = re.findall(r"```(\S+)\n(.*?)```", raw_output, re.DOTALL)
-    if not blocks:
-        raise ValueError("Agent did not produce any skill files")
-
-    skill_md_content = next((c for f, c in blocks if f == "skill.md"), None)
-    if not skill_md_content:
-        raise ValueError("Agent did not produce SKILL.md")
-
-    name_match = re.search(r"^name:\s*(.+)$", skill_md_content, re.MULTILINE)
-    skill_name = skill_name_override or (name_match.group(1).strip() if name_match else str(uuid.uuid4())[:8])
-    skill_dir = os.path.join(SKILLS_OUTPUT_DIR, skill_name)
-
-    files_created = []
-    for fname, content in blocks:
-        target = "SKILL.md" if fname == "skill.md" else fname
-        file_path = os.path.join(skill_dir, target)
-        os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        with open(file_path, "w") as f:
-            f.write(content.strip())
-        files_created.append(target)
-
-    return skill_name, skill_dir, files_created
-
-
-@app.post("/skills", response_model=CreateSkillResponse)
-async def create_skill(req: CreateSkillRequest):
-    """Generate a complete skill from natural language intent."""
-    session = await session_service.create_session(
-        app_name="skill-builder-api",
-        user_id="skill-builder",
-    )
-
-    message = types.Content(
-        role="user",
-        parts=[types.Part(text=f"Create a complete skill for: {req.intent}")]
-    )
-
-    raw_output = ""
-    async for event in runner.run_async(
-        user_id="skill-builder",
-        session_id=session.id,
-        new_message=message,
-    ):
-        if event.is_final_response() and event.content:
-            for part in event.content.parts:
-                if part.text:
-                    raw_output += part.text
-
-    skill_name, skill_dir, files_created = _parse_and_save(raw_output, req.name)
-
-    draft_id = str(uuid.uuid4())
-    draft_registry[draft_id] = {
-        "skill_name": skill_name,
-        "skill_path": skill_dir,
-        "files": {f: open(os.path.join(skill_dir, f)).read() for f in files_created},
-    }
-
-    return CreateSkillResponse(
-        draft_id=draft_id,
-        skill_name=skill_name,
-        skill_path=skill_dir,
-        files_created=files_created,
-    )
-
-
-def sse(event: str, data: dict) -> str:
-    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
-
-
-@app.post("/skills/stream")
-async def create_skill_stream(req: CreateSkillRequest):
-    """Stream skill creation as Server-Sent Events.
-
-    Events:
-      status  — phase progress: {message}
-      token   — partial agent output: {text}
-      file    — file saved: {name, path, content}
-      done    — completion: {draft_id, skill_name, files_created}
-      error   — failure: {detail}
-    """
-    async def event_stream() -> AsyncGenerator[str, None]:
-        try:
-            yield sse("status", {"message": "Starting skill creation..."})
-
-            session = await session_service.create_session(
-                app_name="skill-builder-api",
-                user_id="skill-builder",
-            )
-
-            message = types.Content(
-                role="user",
-                parts=[types.Part(text=f"Create a complete skill for: {req.intent}")]
-            )
-
-            yield sse("status", {"message": "Agent thinking..."})
-
-            raw_output = ""
-            async for event in runner.run_async(
-                user_id="skill-builder",
-                session_id=session.id,
-                new_message=message,
-            ):
-                if hasattr(event, "content") and event.content:
-                    for part in event.content.parts:
-                        if part.text and not event.is_final_response():
-                            yield sse("token", {"text": part.text})
-
-                if event.is_final_response() and event.content:
-                    for part in event.content.parts:
-                        if part.text:
-                            raw_output += part.text
-
-            yield sse("status", {"message": "Parsing and saving files..."})
-
-            blocks = re.findall(r"```(\S+)\n(.*?)```", raw_output, re.DOTALL)
-            if not blocks:
-                yield sse("error", {"detail": "Agent did not produce any skill files"})
-                return
-
-            skill_md_content = next((c for f, c in blocks if f == "skill.md"), None)
-            if not skill_md_content:
-                yield sse("error", {"detail": "Agent did not produce SKILL.md"})
-                return
-
-            name_match = re.search(r"^name:\s*(.+)$", skill_md_content, re.MULTILINE)
-            skill_name = req.name or (name_match.group(1).strip() if name_match else str(uuid.uuid4())[:8])
-            skill_dir = os.path.join(SKILLS_OUTPUT_DIR, skill_name)
-
-            files_created = []
-            for fname, content in blocks:
-                target = "SKILL.md" if fname == "skill.md" else fname
-                file_path = os.path.join(skill_dir, target)
-                os.makedirs(os.path.dirname(file_path), exist_ok=True)
-                stripped = content.strip()
-                with open(file_path, "w") as f:
-                    f.write(stripped)
-                files_created.append(target)
-
-                # Emit file event with full content inline
-                yield sse("file", {
-                    "name": target,
-                    "path": file_path,
-                    "content": stripped,
-                })
-
-            draft_id = str(uuid.uuid4())
-            draft_registry[draft_id] = {
-                "skill_name": skill_name,
-                "skill_path": skill_dir,
-                "files": {f: open(os.path.join(skill_dir, f)).read() for f in files_created},
-            }
-
-            yield sse("done", {
-                "draft_id": draft_id,
-                "skill_name": skill_name,
-                "files_created": files_created,
-            })
-
-        except Exception as e:
-            yield sse("error", {"detail": str(e)})
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
-    )
-
-
-@app.get("/skills/{draft_id}", response_model=GetSkillResponse)
-async def get_skill(draft_id: str):
-    """Retrieve a generated skill by draft ID."""
-    if draft_id not in draft_registry:
-        raise HTTPException(status_code=404, detail="Draft not found")
-    entry = draft_registry[draft_id]
-    return GetSkillResponse(
-        draft_id=draft_id,
-        skill_name=entry["skill_name"],
-        skill_path=entry["skill_path"],
-        files=entry["files"],
-    )
-
-
-@app.get("/skills/{draft_id}/files/{file_path:path}")
-async def get_skill_file(draft_id: str, file_path: str):
-    """Get raw content of a single file within a skill draft."""
-    if draft_id not in draft_registry:
-        raise HTTPException(status_code=404, detail="Draft not found")
-
-    skill_dir = draft_registry[draft_id]["skill_path"]
-    full_path = os.path.normpath(os.path.join(skill_dir, file_path))
-
-    if not full_path.startswith(os.path.abspath(skill_dir)):
-        raise HTTPException(status_code=400, detail="Invalid file path")
-
-    if not os.path.isfile(full_path):
-        raise HTTPException(status_code=404, detail=f"File '{file_path}' not found in skill")
-
-    with open(full_path) as f:
-        content = f.read()
-
-    return {"file_path": file_path, "content": content}
-
-
-@app.get("/skills/{draft_id}/download")
-async def download_skill_zip(draft_id: str):
-    """Download the entire skill as a zip file."""
-    if draft_id not in draft_registry:
-        raise HTTPException(status_code=404, detail="Draft not found")
-
-    entry = draft_registry[draft_id]
-    skill_dir = entry["skill_path"]
-    skill_name = entry["skill_name"]
-
-    if not os.path.isdir(skill_dir):
-        raise HTTPException(status_code=404, detail="Skill files not found on disk")
-
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        for root, _, files in os.walk(skill_dir):
-            for fname in files:
-                abs_path = os.path.join(root, fname)
-                arc_path = os.path.join(skill_name, os.path.relpath(abs_path, skill_dir))
-                zf.write(abs_path, arc_path)
-
-    buffer.seek(0)
-    return StreamingResponse(
-        buffer,
-        media_type="application/zip",
-        headers={"Content-Disposition": f"attachment; filename={skill_name}.zip"},
-    )
-
-
-# Chat session registry: session_id -> adk_session_id
-chat_sessions: dict[str, str] = {}
-
+# ── Models ────────────────────────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
     message: str
-    session_id: Optional[str] = None  # omit to start a new conversation
+    session_id: Optional[str] = None   # omit to start a new conversation
+    skill_name: Optional[str] = None   # optional name override for generated skill
 
 
 class ChatResponse(BaseModel):
     session_id: str
     reply: str
-    draft_id: Optional[str] = None   # set when agent produces a skill draft
+    draft_id: Optional[str] = None     # set when agent produces a skill this turn
 
 
-@app.post("/skills/chat", response_model=ChatResponse)
-async def skill_chat(req: ChatRequest):
-    """Multi-turn conversation for iterative skill creation.
+class DraftResponse(BaseModel):
+    draft_id: str
+    skill_name: str
+    skill_dir: str
+    files: dict[str, str]
+    created_at: str
 
-    Start a new conversation by omitting session_id.
-    Pass the returned session_id in subsequent turns to continue.
-    A draft_id is returned whenever the agent produces a SKILL.md.
-    """
-    sid = req.session_id or str(uuid.uuid4())
 
-    # Get or create ADK session for this conversation
-    if sid not in chat_sessions:
-        adk_session = await session_service.create_session(
-            app_name="skill-builder-api",
-            user_id=sid,
-        )
-        chat_sessions[sid] = adk_session.id
+# ── SSE helper ────────────────────────────────────────────────────────────────
 
-    message = types.Content(
-        role="user",
-        parts=[types.Part(text=req.message)]
+def sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+# ── Session helper ────────────────────────────────────────────────────────────
+
+async def get_or_create_session(session_id: str) -> tuple[str, bool]:
+    """Return (adk_session_id, is_new). Creates ADK session if needed."""
+    adk_id = storage.get_adk_session_id(session_id)
+    if adk_id:
+        return adk_id, False
+    adk_session = await ag.session_service.create_session(
+        app_name=ag.APP_NAME,
+        user_id=session_id,
     )
+    storage.save_session(session_id, adk_session.id)
+    return adk_session.id, True
 
-    reply = ""
-    async for event in runner.run_async(
-        user_id=sid,
-        session_id=chat_sessions[sid],
-        new_message=message,
-    ):
-        if event.is_final_response() and event.content:
-            for part in event.content.parts:
-                if part.text:
-                    reply += part.text
 
-    # Save draft if agent produced a skill
-    draft_id = None
-    blocks = re.findall(r"```(\S+)\n(.*?)```", reply, re.DOTALL)
-    if blocks and any(f == "skill.md" for f, _ in blocks):
-        try:
-            skill_name, skill_dir, files_created = _parse_and_save(reply, None)
-            draft_id = str(uuid.uuid4())
-            draft_registry[draft_id] = {
-                "skill_name": skill_name,
-                "skill_path": skill_dir,
-                "files": {f: open(os.path.join(skill_dir, f)).read() for f in files_created},
-            }
-        except ValueError:
-            pass  # agent replied with text only, no skill yet
-
-    return ChatResponse(session_id=sid, reply=reply, draft_id=draft_id)
-
+# ── Primary endpoint: multi-turn chat with SSE streaming ─────────────────────
 
 @app.post("/skills/chat/stream")
-async def skill_chat_stream(req: ChatRequest):
-    """Multi-turn conversation with SSE streaming.
+async def chat_stream(req: ChatRequest):
+    """Multi-turn skill creation with real-time SSE streaming.
 
-    Events:
-      status  — phase progress: {message}
-      token   — partial reply: {text}
-      draft   — skill draft saved: {draft_id, skill_name, files_created}
-      done    — turn complete: {session_id, draft_id}
-      error   — failure: {detail}
+    Start a conversation by omitting session_id.
+    Pass the returned session_id to continue the same conversation.
+
+    Events emitted:
+      status  {message}                          — phase progress
+      token   {text}                             — partial agent reply (live)
+      draft   {draft_id, skill_name, files_created} — skill saved this turn
+      done    {session_id, draft_id}             — turn complete
+      error   {detail}                           — failure, stream closes
     """
-    async def event_stream() -> AsyncGenerator[str, None]:
+    async def stream() -> AsyncGenerator[str, None]:
         try:
             sid = req.session_id or str(uuid.uuid4())
+            adk_session_id, is_new = await get_or_create_session(sid)
 
-            if sid not in chat_sessions:
-                yield sse("status", {"message": "Starting new conversation..."})
-                adk_session = await session_service.create_session(
-                    app_name="skill-builder-api",
-                    user_id=sid,
-                )
-                chat_sessions[sid] = adk_session.id
-            else:
-                yield sse("status", {"message": "Continuing conversation..."})
+            yield sse("status", {
+                "message": "New conversation started" if is_new else "Continuing conversation",
+                "session_id": sid,
+            })
 
             message = types.Content(
                 role="user",
@@ -404,11 +102,12 @@ async def skill_chat_stream(req: ChatRequest):
             )
 
             reply = ""
-            async for event in runner.run_async(
+            async for event in ag.runner.run_async(
                 user_id=sid,
-                session_id=chat_sessions[sid],
+                session_id=adk_session_id,
                 new_message=message,
             ):
+                # Stream tokens as agent writes
                 if hasattr(event, "content") and event.content:
                     for part in event.content.parts:
                         if part.text and not event.is_final_response():
@@ -419,25 +118,21 @@ async def skill_chat_stream(req: ChatRequest):
                         if part.text:
                             reply += part.text
 
-            # Save draft if this turn produced a skill
+            # Save draft if agent produced a skill this turn
             draft_id = None
-            blocks = re.findall(r"```(\S+)\n(.*?)```", reply, re.DOTALL)
+            blocks = ag.parse_skill_blocks(reply)
             if blocks and any(f == "skill.md" for f, _ in blocks):
                 try:
-                    skill_name, skill_dir, files_created = _parse_and_save(reply, None)
-                    draft_id = str(uuid.uuid4())
-                    draft_registry[draft_id] = {
-                        "skill_name": skill_name,
-                        "skill_path": skill_dir,
-                        "files": {f: open(os.path.join(skill_dir, f)).read() for f in files_created},
-                    }
+                    result = save_skill_from_output(reply, req.skill_name)
+                    draft_id = result["draft_id"]
                     yield sse("draft", {
                         "draft_id": draft_id,
-                        "skill_name": skill_name,
-                        "files_created": files_created,
+                        "skill_name": result["skill_name"],
+                        "files_created": result["files_created"],
                     })
-                except ValueError:
-                    pass
+                except SkillParseError as e:
+                    yield sse("error", {"detail": str(e)})
+                    return
 
             yield sse("done", {"session_id": sid, "draft_id": draft_id})
 
@@ -445,19 +140,103 @@ async def skill_chat_stream(req: ChatRequest):
             yield sse("error", {"detail": str(e)})
 
     return StreamingResponse(
-        event_stream(),
+        stream(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
-@app.get("/skills")
-async def list_skills():
-    """List all generated skill drafts."""
-    return {
-        "drafts": [
-            {"draft_id": did, "skill_name": v["skill_name"], "skill_path": v["skill_path"]}
-            for did, v in draft_registry.items()
-        ],
-        "count": len(draft_registry),
-    }
+# ── Non-streaming chat (simple clients) ──────────────────────────────────────
+
+@app.post("/skills/chat", response_model=ChatResponse)
+async def chat(req: ChatRequest):
+    """Multi-turn skill creation — non-streaming version.
+
+    Use /skills/chat/stream for real-time UI; use this for CLI or simple clients.
+    """
+    sid = req.session_id or str(uuid.uuid4())
+    adk_session_id, _ = await get_or_create_session(sid)
+
+    message = types.Content(
+        role="user",
+        parts=[types.Part(text=req.message)]
+    )
+
+    reply = ""
+    async for event in ag.runner.run_async(
+        user_id=sid,
+        session_id=adk_session_id,
+        new_message=message,
+    ):
+        if event.is_final_response() and event.content:
+            for part in event.content.parts:
+                if part.text:
+                    reply += part.text
+
+    draft_id = None
+    blocks = ag.parse_skill_blocks(reply)
+    if blocks and any(f == "skill.md" for f, _ in blocks):
+        try:
+            result = save_skill_from_output(reply, req.skill_name)
+            draft_id = result["draft_id"]
+        except SkillParseError:
+            pass
+
+    return ChatResponse(session_id=sid, reply=reply, draft_id=draft_id)
+
+
+# ── Draft endpoints ───────────────────────────────────────────────────────────
+
+@app.get("/skills", summary="List all skill drafts")
+async def list_drafts():
+    return {"drafts": storage.list_drafts(), "count": len(storage.list_drafts())}
+
+
+@app.get("/skills/{draft_id}", response_model=DraftResponse)
+async def get_draft(draft_id: str):
+    """Get a skill draft with all file contents."""
+    draft = storage.get_draft(draft_id)
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    return DraftResponse(
+        draft_id=draft["draft_id"],
+        skill_name=draft["skill_name"],
+        skill_dir=draft["skill_dir"],
+        files=draft["files"],
+        created_at=draft["created_at"],
+    )
+
+
+@app.get("/skills/{draft_id}/files/{file_path:path}", summary="Get a single file from a draft")
+async def get_draft_file(draft_id: str, file_path: str):
+    """Get raw content of a single file (e.g. SKILL.md, references/REFERENCE.md)."""
+    draft = storage.get_draft(draft_id)
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    if file_path not in draft["files"]:
+        raise HTTPException(status_code=404, detail=f"File '{file_path}' not found in draft")
+    return {"file_path": file_path, "content": draft["files"][file_path]}
+
+
+@app.get("/skills/{draft_id}/download", summary="Download skill as zip")
+async def download_draft(draft_id: str):
+    """Download the entire skill directory as a zip file."""
+    draft = storage.get_draft(draft_id)
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    if not os.path.isdir(draft["skill_dir"]):
+        raise HTTPException(status_code=404, detail="Skill files not found on disk")
+
+    buffer = build_zip(draft["skill_name"], draft["skill_dir"])
+    return StreamingResponse(
+        buffer,
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename={draft['skill_name']}.zip"},
+    )
+
+
+# ── Health ────────────────────────────────────────────────────────────────────
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "version": app.version}
