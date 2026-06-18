@@ -55,6 +55,16 @@ def sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
+def extract_reply_text(raw: str) -> str:
+    """Strip fenced skill blocks from agent output, leaving only the conversational reply.
+
+    The agent mixes prose ('Here is your skill:') with fenced file blocks
+    (```skill.md ... ```). UI should only show the prose as streaming tokens;
+    file contents are delivered separately via the draft event.
+    """
+    return re.sub(r"```\S+\n.*?```", "", raw, flags=re.DOTALL).strip()
+
+
 # ── Session helper ────────────────────────────────────────────────────────────
 
 async def get_or_create_session(session_id: str) -> tuple[str, bool]:
@@ -101,34 +111,34 @@ async def chat_stream(req: ChatRequest):
                 parts=[types.Part(text=req.message)]
             )
 
-            reply = ""
+            raw_reply = ""
             async for event in ag.runner.run_async(
                 user_id=sid,
                 session_id=adk_session_id,
                 new_message=message,
             ):
-                # Stream tokens as agent writes
-                if hasattr(event, "content") and event.content:
-                    for part in event.content.parts:
-                        if part.text and not event.is_final_response():
-                            yield sse("token", {"text": part.text})
-
                 if event.is_final_response() and event.content:
                     for part in event.content.parts:
                         if part.text:
-                            reply += part.text
+                            raw_reply += part.text
 
-            # Save draft if agent produced a skill this turn
+            # Stream only the conversational prose — no fenced file blocks
+            reply_text = extract_reply_text(raw_reply)
+            if reply_text:
+                yield sse("token", {"text": reply_text})
+
+            # Save draft and emit file contents if agent produced a skill this turn
             draft_id = None
-            blocks = ag.parse_skill_blocks(reply)
+            blocks = ag.parse_skill_blocks(raw_reply)
             if blocks and any(f == "skill.md" for f, _ in blocks):
                 try:
-                    result = save_skill_from_output(reply, req.skill_name)
+                    result = save_skill_from_output(raw_reply, req.skill_name)
                     draft_id = result["draft_id"]
                     yield sse("draft", {
                         "draft_id": draft_id,
                         "skill_name": result["skill_name"],
                         "files_created": result["files_created"],
+                        "files": result["files"],   # full content per file for UI preview
                     })
                 except SkillParseError as e:
                     yield sse("error", {"detail": str(e)})
