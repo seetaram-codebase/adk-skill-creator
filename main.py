@@ -10,16 +10,12 @@ from google.adk.sessions import InMemorySessionService
 from google.adk.tools.skill_toolset import SkillToolset
 from google.genai import types
 
-app = FastAPI(title="ADK Skill Creator", version="1.0.0")
+app = FastAPI(title="Skill Builder API", version="1.0.0")
 
-# SkillToolset loads the skill-creator SKILL.md with progressive disclosure:
-# L1 (~100 tokens): name + description loaded at startup
-# L2 (<5000 tokens): full instructions loaded when skill is activated
-# L3 (as needed): reference files loaded on demand
 skill_toolset = SkillToolset(skills_dir="./skills/skill-creator")
 
 agent = LlmAgent(
-    name="skill_creator_agent",
+    name="skill_builder_agent",
     model="gemini-2.5-pro",
     instruction="""You create complete, production-ready skills from user intent.
 
@@ -42,7 +38,7 @@ Rules:
 session_service = InMemorySessionService()
 runner = Runner(
     agent=agent,
-    app_name="skill-creator-api",
+    app_name="skill-builder-api",
     session_service=session_service,
 )
 
@@ -51,8 +47,8 @@ os.makedirs(SKILLS_OUTPUT_DIR, exist_ok=True)
 
 
 class CreateSkillRequest(BaseModel):
-    intent: str          # e.g. "review pull requests for security vulnerabilities"
-    name: Optional[str] = None  # optional slug override, e.g. "pr-security-review"
+    intent: str
+    name: Optional[str] = None
 
 
 class CreateSkillResponse(BaseModel):
@@ -66,19 +62,45 @@ class GetSkillResponse(BaseModel):
     draft_id: str
     skill_name: str
     skill_path: str
-    files: dict[str, str]  # relative path -> content
+    files: dict[str, str]
 
 
 # In-memory draft registry: draft_id -> {skill_name, skill_path, files}
 draft_registry: dict[str, dict] = {}
 
 
+def _parse_and_save(raw_output: str, skill_name_override: Optional[str]) -> tuple[str, str, list[str]]:
+    """Parse fenced blocks from agent output, save to disk, return (skill_name, skill_dir, files_created)."""
+    blocks = re.findall(r"```(\S+)\n(.*?)```", raw_output, re.DOTALL)
+    if not blocks:
+        raise ValueError("Agent did not produce any skill files")
+
+    skill_md_content = next((c for f, c in blocks if f == "skill.md"), None)
+    if not skill_md_content:
+        raise ValueError("Agent did not produce SKILL.md")
+
+    name_match = re.search(r"^name:\s*(.+)$", skill_md_content, re.MULTILINE)
+    skill_name = skill_name_override or (name_match.group(1).strip() if name_match else str(uuid.uuid4())[:8])
+    skill_dir = os.path.join(SKILLS_OUTPUT_DIR, skill_name)
+
+    files_created = []
+    for fname, content in blocks:
+        target = "SKILL.md" if fname == "skill.md" else fname
+        file_path = os.path.join(skill_dir, target)
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        with open(file_path, "w") as f:
+            f.write(content.strip())
+        files_created.append(target)
+
+    return skill_name, skill_dir, files_created
+
+
 @app.post("/skills", response_model=CreateSkillResponse)
 async def create_skill(req: CreateSkillRequest):
     """Generate a complete skill from natural language intent."""
     session = await session_service.create_session(
-        app_name="skill-creator-api",
-        user_id="skill-creator",
+        app_name="skill-builder-api",
+        user_id="skill-builder",
     )
 
     message = types.Content(
@@ -88,7 +110,7 @@ async def create_skill(req: CreateSkillRequest):
 
     raw_output = ""
     async for event in runner.run_async(
-        user_id="skill-creator",
+        user_id="skill-builder",
         session_id=session.id,
         new_message=message,
     ):
@@ -97,31 +119,7 @@ async def create_skill(req: CreateSkillRequest):
                 if part.text:
                     raw_output += part.text
 
-    # Parse all named fenced blocks: ```filename\ncontent```
-    blocks = re.findall(r"```(\S+)\n(.*?)```", raw_output, re.DOTALL)
-    if not blocks:
-        raise HTTPException(status_code=500, detail="Agent did not produce any skill files")
-
-    skill_md_content = next((c for f, c in blocks if f == "skill.md"), None)
-    if not skill_md_content:
-        raise HTTPException(status_code=500, detail="Agent did not produce SKILL.md")
-
-    # Extract skill name from frontmatter
-    name_match = re.search(r"^name:\s*(.+)$", skill_md_content, re.MULTILINE)
-    skill_name = req.name or (name_match.group(1).strip() if name_match else str(uuid.uuid4())[:8])
-
-    # Write all files to disk
-    skill_dir = os.path.join(SKILLS_OUTPUT_DIR, skill_name)
-    files_created = []
-
-    for fname, content in blocks:
-        # Remap skill.md -> SKILL.md
-        target = "SKILL.md" if fname == "skill.md" else fname
-        file_path = os.path.join(skill_dir, target)
-        os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        with open(file_path, "w") as f:
-            f.write(content.strip())
-        files_created.append(target)
+    skill_name, skill_dir, files_created = _parse_and_save(raw_output, req.name)
 
     draft_id = str(uuid.uuid4())
     draft_registry[draft_id] = {
@@ -139,28 +137,27 @@ async def create_skill(req: CreateSkillRequest):
 
 
 def sse(event: str, data: dict) -> str:
-    """Format a server-sent event."""
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
 @app.post("/skills/stream")
 async def create_skill_stream(req: CreateSkillRequest):
-    """Stream skill creation progress as Server-Sent Events.
+    """Stream skill creation as Server-Sent Events.
 
-    Events emitted:
-      status   — progress updates (thinking, generating, saving)
-      token    — partial text as the agent streams output
-      file     — each file saved to disk: {name, path}
-      done     — final summary: {draft_id, skill_name, files_created}
-      error    — if something goes wrong: {detail}
+    Events:
+      status  — phase progress: {message}
+      token   — partial agent output: {text}
+      file    — file saved: {name, path, content}
+      done    — completion: {draft_id, skill_name, files_created}
+      error   — failure: {detail}
     """
     async def event_stream() -> AsyncGenerator[str, None]:
         try:
             yield sse("status", {"message": "Starting skill creation..."})
 
             session = await session_service.create_session(
-                app_name="skill-creator-api",
-                user_id="skill-creator",
+                app_name="skill-builder-api",
+                user_id="skill-builder",
             )
 
             message = types.Content(
@@ -172,11 +169,10 @@ async def create_skill_stream(req: CreateSkillRequest):
 
             raw_output = ""
             async for event in runner.run_async(
-                user_id="skill-creator",
+                user_id="skill-builder",
                 session_id=session.id,
                 new_message=message,
             ):
-                # Stream partial text tokens as they arrive
                 if hasattr(event, "content") and event.content:
                     for part in event.content.parts:
                         if part.text and not event.is_final_response():
@@ -208,10 +204,17 @@ async def create_skill_stream(req: CreateSkillRequest):
                 target = "SKILL.md" if fname == "skill.md" else fname
                 file_path = os.path.join(skill_dir, target)
                 os.makedirs(os.path.dirname(file_path), exist_ok=True)
+                stripped = content.strip()
                 with open(file_path, "w") as f:
-                    f.write(content.strip())
+                    f.write(stripped)
                 files_created.append(target)
-                yield sse("file", {"name": target, "path": file_path})
+
+                # Emit file event with full content inline
+                yield sse("file", {
+                    "name": target,
+                    "path": file_path,
+                    "content": stripped,
+                })
 
             draft_id = str(uuid.uuid4())
             draft_registry[draft_id] = {
@@ -234,7 +237,7 @@ async def create_skill_stream(req: CreateSkillRequest):
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",  # disable nginx buffering
+            "X-Accel-Buffering": "no",
         },
     )
 
@@ -255,21 +258,13 @@ async def get_skill(draft_id: str):
 
 @app.get("/skills/{draft_id}/files/{file_path:path}")
 async def get_skill_file(draft_id: str, file_path: str):
-    """Get the raw content of a single file within a skill draft.
-
-    Examples:
-      GET /skills/{draft_id}/files/SKILL.md
-      GET /skills/{draft_id}/files/references/REFERENCE.md
-      GET /skills/{draft_id}/files/scripts/run.py
-      GET /skills/{draft_id}/files/assets/template.md
-    """
+    """Get raw content of a single file within a skill draft."""
     if draft_id not in draft_registry:
         raise HTTPException(status_code=404, detail="Draft not found")
 
     skill_dir = draft_registry[draft_id]["skill_path"]
     full_path = os.path.normpath(os.path.join(skill_dir, file_path))
 
-    # Prevent path traversal
     if not full_path.startswith(os.path.abspath(skill_dir)):
         raise HTTPException(status_code=400, detail="Invalid file path")
 
@@ -284,12 +279,7 @@ async def get_skill_file(draft_id: str, file_path: str):
 
 @app.get("/skills/{draft_id}/download")
 async def download_skill_zip(draft_id: str):
-    """Download the entire skill as a zip file.
-
-    Example:
-      GET /skills/{draft_id}/download
-      → pr-security-review.zip containing SKILL.md, references/, scripts/, assets/
-    """
+    """Download the entire skill as a zip file."""
     if draft_id not in draft_registry:
         raise HTTPException(status_code=404, detail="Draft not found")
 
@@ -305,7 +295,6 @@ async def download_skill_zip(draft_id: str):
         for root, _, files in os.walk(skill_dir):
             for fname in files:
                 abs_path = os.path.join(root, fname)
-                # Zip entry path: skill-name/SKILL.md, skill-name/references/REFERENCE.md, etc.
                 arc_path = os.path.join(skill_name, os.path.relpath(abs_path, skill_dir))
                 zf.write(abs_path, arc_path)
 
