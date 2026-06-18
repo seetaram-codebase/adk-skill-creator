@@ -16,9 +16,9 @@ def init_db():
             );
 
             CREATE TABLE IF NOT EXISTS sessions (
-                session_id      TEXT PRIMARY KEY,
-                adk_session_id  TEXT NOT NULL,
-                created_at      DATETIME DEFAULT CURRENT_TIMESTAMP
+                conversation_id  TEXT PRIMARY KEY,
+                adk_session_id   TEXT NOT NULL,
+                created_at       DATETIME DEFAULT CURRENT_TIMESTAMP
             );
         """)
 
@@ -68,17 +68,17 @@ def list_drafts() -> list[dict]:
 
 # --- Sessions ---
 
-def save_session(session_id: str, adk_session_id: str):
+def save_session(conversation_id: str, adk_session_id: str):
     with _conn() as conn:
         conn.execute(
-            "INSERT OR IGNORE INTO sessions (session_id, adk_session_id) VALUES (?,?)",
-            (session_id, adk_session_id),
+            "INSERT OR IGNORE INTO sessions (conversation_id, adk_session_id) VALUES (?,?)",
+            (conversation_id, adk_session_id),
         )
 
 
-def get_adk_session_id(session_id: str) -> str | None:
+def get_adk_session_id(conversation_id: str) -> str | None:
     with _conn() as conn:
         row = conn.execute(
-            "SELECT adk_session_id FROM sessions WHERE session_id=?", (session_id,)
+            "SELECT adk_session_id FROM sessions WHERE conversation_id=?", (conversation_id,)
         ).fetchone()
     return row["adk_session_id"] if row else None

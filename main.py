@@ -31,12 +31,12 @@ app.add_middleware(
 
 class ChatRequest(BaseModel):
     message: str
-    session_id: Optional[str] = None   # omit to start a new conversation
+    conversation_id: Optional[str] = None   # omit to start a new conversation
     skill_name: Optional[str] = None   # optional name override for generated skill
 
 
 class ChatResponse(BaseModel):
-    session_id: str
+    conversation_id: str
     reply: str
     draft_id: Optional[str] = None     # set when agent produces a skill this turn
 
@@ -67,16 +67,16 @@ def extract_reply_text(raw: str) -> str:
 
 # ── Session helper ────────────────────────────────────────────────────────────
 
-async def get_or_create_session(session_id: str) -> tuple[str, bool]:
+async def get_or_create_session(conversation_id: str) -> tuple[str, bool]:
     """Return (adk_session_id, is_new). Creates ADK session if needed."""
-    adk_id = storage.get_adk_session_id(session_id)
+    adk_id = storage.get_adk_session_id(conversation_id)
     if adk_id:
         return adk_id, False
     adk_session = await ag.session_service.create_session(
         app_name=ag.APP_NAME,
-        user_id=session_id,
+        user_id=conversation_id,
     )
-    storage.save_session(session_id, adk_session.id)
+    storage.save_session(conversation_id, adk_session.id)
     return adk_session.id, True
 
 
@@ -86,24 +86,24 @@ async def get_or_create_session(session_id: str) -> tuple[str, bool]:
 async def chat_stream(req: ChatRequest):
     """Multi-turn skill creation with real-time SSE streaming.
 
-    Start a conversation by omitting session_id.
-    Pass the returned session_id to continue the same conversation.
+    Start a conversation by omitting conversation_id.
+    Pass the returned conversation_id to continue the same conversation.
 
     Events emitted:
       status  {message}                          — phase progress
       token   {text}                             — partial agent reply (live)
       draft   {draft_id, skill_name, files_created} — skill saved this turn
-      done    {session_id, draft_id}             — turn complete
+      done    {conversation_id, draft_id}             — turn complete
       error   {detail}                           — failure, stream closes
     """
     async def stream() -> AsyncGenerator[str, None]:
         try:
-            sid = req.session_id or str(uuid.uuid4())
-            adk_session_id, is_new = await get_or_create_session(sid)
+            sid = req.conversation_id or str(uuid.uuid4())
+            adk_conversation_id, is_new = await get_or_create_session(sid)
 
             yield sse("status", {
                 "message": "New conversation started" if is_new else "Continuing conversation",
-                "session_id": sid,
+                "conversation_id": sid,
             })
 
             message = types.Content(
@@ -114,7 +114,7 @@ async def chat_stream(req: ChatRequest):
             raw_reply = ""
             async for event in ag.runner.run_async(
                 user_id=sid,
-                session_id=adk_session_id,
+                conversation_id=adk_conversation_id,
                 new_message=message,
             ):
                 if event.is_final_response() and event.content:
@@ -144,7 +144,7 @@ async def chat_stream(req: ChatRequest):
                     yield sse("error", {"detail": str(e)})
                     return
 
-            yield sse("done", {"session_id": sid, "draft_id": draft_id})
+            yield sse("done", {"conversation_id": sid, "draft_id": draft_id})
 
         except Exception as e:
             yield sse("error", {"detail": str(e)})
@@ -164,8 +164,8 @@ async def chat(req: ChatRequest):
 
     Use /skills/chat/stream for real-time UI; use this for CLI or simple clients.
     """
-    sid = req.session_id or str(uuid.uuid4())
-    adk_session_id, _ = await get_or_create_session(sid)
+    sid = req.conversation_id or str(uuid.uuid4())
+    adk_conversation_id, _ = await get_or_create_session(sid)
 
     message = types.Content(
         role="user",
@@ -175,7 +175,7 @@ async def chat(req: ChatRequest):
     reply = ""
     async for event in ag.runner.run_async(
         user_id=sid,
-        session_id=adk_session_id,
+        conversation_id=adk_conversation_id,
         new_message=message,
     ):
         if event.is_final_response() and event.content:
@@ -192,7 +192,7 @@ async def chat(req: ChatRequest):
         except SkillParseError:
             pass
 
-    return ChatResponse(session_id=sid, reply=reply, draft_id=draft_id)
+    return ChatResponse(conversation_id=sid, reply=reply, draft_id=draft_id)
 
 
 # ── Draft endpoints ───────────────────────────────────────────────────────────
